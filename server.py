@@ -10,18 +10,20 @@ Optional env vars:
   PORT             default 8000
 """
 import html
+import logging
 import os
 import re
 import threading
 import time
 from collections import defaultdict, deque
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 import yt_dlp
 from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__, static_folder="public", static_url_path="")
+app.logger.setLevel(logging.INFO)
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -112,6 +114,11 @@ def video_items(info):
         if not e:
             continue
         formats = e.get("formats") or ([e] if e.get("url") else [])
+        app.logger.info(
+            "formats: %s",
+            [(f.get("format_id"), f.get("height"), f.get("protocol"), f.get("vcodec"), f.get("acodec"), f.get("ext"))
+             for f in formats],
+        )
         best = {}
         for f in formats:
             u = f.get("url")
@@ -184,6 +191,22 @@ def photo_fallback(url):
     if not img or not allowed(img):
         return None
     return {"url": img, "title": meta("og:title", r.text)[:140]}
+
+
+def open_upstream(url, max_hops=3):
+    """GET a CDN file. Redirects are followed only when they stay on allowed CDN hosts."""
+    headers = {"User-Agent": UA, "Referer": "https://www.instagram.com/", "Accept": "*/*"}
+    for _ in range(max_hops + 1):
+        r = requests.get(url, headers=headers, stream=True, timeout=(8, 20), allow_redirects=False)
+        if r.status_code in (301, 302, 303, 307, 308):
+            nxt = urljoin(url, r.headers.get("Location", ""))
+            r.close()
+            if not allowed(nxt):
+                return None
+            url = nxt
+            continue
+        return r
+    return None
 
 
 # ---------- routes ----------
@@ -271,17 +294,23 @@ def api_media():
     dl = request.args.get("dl") == "1"
 
     try:
-        up = requests.get(
-            u,
-            headers={"User-Agent": UA},
-            stream=True,
-            timeout=(8, 20),
-            allow_redirects=False,
-        )
-    except requests.RequestException:
+        up = open_upstream(u)
+    except requests.RequestException as e:
+        app.logger.warning("media: request failed host=%s err=%s", urlparse(u).hostname, e)
         return "Upstream error", 502
-    ctype = up.headers.get("Content-Type", "")
-    if up.status_code != 200 or not (ctype.startswith("video/") or ctype.startswith("image/")):
+    if up is None:
+        app.logger.warning("media: redirect blocked or too many hops host=%s", urlparse(u).hostname)
+        return "Upstream error", 502
+
+    ctype = up.headers.get("Content-Type", "").split(";")[0].strip().lower()
+    if ctype in ("", "application/octet-stream", "binary/octet-stream"):
+        path = urlparse(u).path.lower()
+        ctype = "video/mp4" if ".mp4" in path else "image/jpeg" if ".jpg" in path else ctype
+    if up.status_code != 200 or not ctype.startswith(("video/", "image/")):
+        app.logger.warning(
+            "media: bad upstream status=%s type=%s host=%s",
+            up.status_code, up.headers.get("Content-Type"), urlparse(u).hostname,
+        )
         up.close()
         return "Upstream error", 502
 
@@ -305,3 +334,4 @@ def api_media():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
